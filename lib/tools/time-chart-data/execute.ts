@@ -3,6 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { fetchMonthlyPrices, currentMonth } from '../shared/goldapi-history';
 
 // Metal name mapping (API symbols to JSON keys)
 const METAL_NAMES = {
@@ -44,6 +45,9 @@ export interface TimeChartDataResult {
         changePercent: number;
       };
     };
+    // How each plotted price was resolved. A non-zero `dataset` count means the
+    // API couldn't serve those months and the checked-in file filled the gap.
+    sources?: { api: number; dataset: number };
   };
   error?: string;
 }
@@ -96,7 +100,17 @@ function generateDateRange(startDate: string, endDate: string, maxPoints: number
   // If we have too many data points, sample them
   if (months.length > maxPoints) {
     const step = Math.ceil(months.length / maxPoints);
-    return months.filter((_, index) => index % step === 0);
+    const sampled = months.filter((_, index) => index % step === 0);
+
+    // Sampling steps from the start, so the final month lands in the result
+    // only by coincidence. Without this a "since 2000" chart stops short of
+    // the present, which reads as missing recent data.
+    const lastMonth = months[months.length - 1];
+    if (sampled[sampled.length - 1] !== lastMonth) {
+      sampled.push(lastMonth);
+    }
+
+    return sampled;
   }
 
   return months;
@@ -113,14 +127,13 @@ export async function executeTimeChartDataTool(
   try {
     console.log('🎨 Time Chart Data Tool - Input:', { metals, startDate, endDate, relativePeriod, currency, dataPoints });
 
-    // Read historical data from JSON file
+    // The checked-in dataset is only a fallback for months the API can't serve;
+    // prices come from goldapi below. Missing file is not fatal.
+    let jsonData: PreciousMetalsData = {};
     const filePath = path.join(process.cwd(), 'data', 'precious_metals.json');
-    if (!fs.existsSync(filePath)) {
-      throw new Error(`Data file not found: ${filePath}`);
+    if (fs.existsSync(filePath)) {
+      jsonData = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     }
-
-    const fileContent = fs.readFileSync(filePath, 'utf-8');
-    const jsonData: PreciousMetalsData = JSON.parse(fileContent);
 
     // Determine date range
     let finalStartDate: string;
@@ -134,9 +147,9 @@ export async function executeTimeChartDataTool(
       finalStartDate = startDate;
       finalEndDate = endDate;
     } else if (startDate) {
-      // Default end date to latest data (September 2025)
+      // Open-ended range runs through the present, not a pinned dataset edge.
       finalStartDate = startDate;
-      finalEndDate = '2025-09';
+      finalEndDate = currentMonth();
     } else {
       // Default to last 12 months
       const parsed = parseRelativePeriod('last 12 months');
@@ -150,7 +163,12 @@ export async function executeTimeChartDataTool(
     const dateRange = generateDateRange(finalStartDate, finalEndDate, dataPoints);
     console.log('📊 Data points:', dateRange.length);
 
-    // Build chart data from JSON
+    // Fetch only the months actually plotted, so a 30-year range costs the same
+    // number of requests as a 1-year one.
+    const apiPrices = await fetchMonthlyPrices(metals, dateRange, currency);
+    const sources = { api: 0, dataset: 0 };
+
+    // Build chart data
     const chartData: ChartDataPoint[] = [];
     const metalStats: { [metal: string]: number[] } = {};
 
@@ -165,16 +183,25 @@ export async function executeTimeChartDataTool(
         prices: {}
       };
 
-      // Get price for each metal from JSON
+      // Prefer the live API; fall back to the checked-in dataset per point.
       for (const metal of metals) {
         try {
-          const metalName = METAL_NAMES[metal as keyof typeof METAL_NAMES];
-          if (!metalName || !jsonData[metalName]) {
-            console.warn(`Metal ${metal} not found in JSON data`);
+          const apiPrice = apiPrices.get(`${metal}:${yearMonth}`);
+
+          if (apiPrice !== undefined) {
+            dataPoint.prices[metal] = apiPrice;
+            metalStats[metal].push(apiPrice);
+            sources.api++;
             continue;
           }
 
-          // Convert YYYY-MM to MM/YYYY for JSON lookup
+          const metalName = METAL_NAMES[metal as keyof typeof METAL_NAMES];
+          if (!metalName || !jsonData[metalName]) {
+            console.warn(`No data available for ${metal} on ${yearMonth}`);
+            continue;
+          }
+
+          // Convert YYYY-MM to MM/YYYY for dataset lookup
           const [year, month] = yearMonth.split('-');
           const jsonDateFormat = `${month}/${year}`;
 
@@ -184,6 +211,7 @@ export async function executeTimeChartDataTool(
           if (dataEntry) {
             dataPoint.prices[metal] = dataEntry.price;
             metalStats[metal].push(dataEntry.price);
+            sources.dataset++;
           } else {
             console.warn(`No data found for ${metal} on ${yearMonth}`);
           }
@@ -223,7 +251,7 @@ export async function executeTimeChartDataTool(
       }
     }
 
-    console.log('✅ Chart data ready:', { dataPointsCount: chartData.length, metals });
+    console.log('✅ Chart data ready:', { dataPointsCount: chartData.length, metals, sources });
 
     return {
       success: true,
@@ -233,7 +261,8 @@ export async function executeTimeChartDataTool(
         startDate: finalStartDate,
         endDate: finalEndDate,
         dataPoints: chartData,
-        summary
+        summary,
+        sources
       }
     };
 
